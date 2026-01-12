@@ -10,7 +10,7 @@ import type * as protocolTypes from '../../bedrock-types.ts';
 import { InputDataService } from './input-data-service.mts';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const { Physics, PlayerState } = require('prismarine-physics');
+const { Physics, PlayerState, PlayerPose, poseEyeHeight } = require('prismarine-physics');
 
 const PI = Math.PI;
 const PI_2 = Math.PI * 2;
@@ -19,9 +19,11 @@ const PHYSICS_TIMESTEP = PHYSICS_INTERVAL_MS / 1000;
 
 interface PhysicsOptions {
   physicsEnabled?: boolean;
+  /** Skip the physics loop timer - for testing. Use bot.test.tick() to manually trigger ticks. */
+  skipPhysicsLoop?: boolean;
 }
 
-export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptions = {}) {
+export default function inject(bot: BedrockBot, { physicsEnabled, skipPhysicsLoop }: PhysicsOptions = {}) {
   const world = {
     getBlock: (pos: Vec3) => {
       return bot.blockAt(pos, false);
@@ -55,7 +57,7 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
 
   let doPhysicsTimer: ReturnType<typeof setInterval> | null = null;
   let lastPhysicsFrameTime: number | null = null;
-  let shouldUsePhysics = false;
+  let shouldUsePhysics = skipPhysicsLoop ?? false; // When skipPhysicsLoop is true, enable physics immediately for manual tick control
   bot.physicsEnabled = physicsEnabled ?? true;
 
   let tick = 0n;
@@ -181,6 +183,8 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
       if (bot.physicsEnabled && shouldUsePhysics) {
         updateCamera();
         physics.simulatePlayer(new PlayerState(bot, controlState), world).apply(bot);
+        // Update eye height based on current pose (swimming = 0.4, standing = 1.62, etc.)
+        bot.entity.height = poseEyeHeight[bot.entity.pose ?? PlayerPose.STANDING] ?? 1.62;
         let subchunkContainingPlayerNew = getChunkCoordinates(bot.entity.position);
         if (subchunkContainingPlayerNew !== subchunkContainingPlayer) {
           subchunkContainingPlayer = subchunkContainingPlayerNew;
@@ -312,16 +316,53 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
       lastSentSprinting = controlState.sprint;
       lastSent.input_data.sprint_down = controlState.sprint;
       lastSent.input_data.sprinting = controlState.sprint;
-      lastSent.input_data.stop_sprinting = !controlState.sprint;
+
+      // Edge-triggered flags - set on state change, cleared next tick
+      if (controlState.sprint) {
+        lastSent.input_data.start_sprinting = true;
+      } else {
+        lastSent.input_data.stop_sprinting = true;
+      }
+    } else {
+      // Clear edge-triggered flags after first tick
+      lastSent.input_data.start_sprinting = false;
+      lastSent.input_data.stop_sprinting = false;
     }
+
+    // Swimming state flags from physics engine
+    // These are set by prismarine-physics based on isSprinting && isUnderWater && isInWater
+    if (bot.entity.startSwimming) {
+      lastSent.input_data.start_swimming = true;
+      bot.entity.startSwimming = false; // Reset after sending
+    }
+    if (bot.entity.stopSwimming) {
+      lastSent.input_data.stop_swimming = true;
+      bot.entity.stopSwimming = false; // Reset after sending
+    }
+
+    // want_down is true while sneaking
+    lastSent.input_data.want_down = controlState.sneak;
+
     if (controlState.sneak !== lastSentSneaking) {
       lastSentSneaking = controlState.sneak;
       lastSent.input_data.sneak_down = controlState.sneak;
       lastSent.input_data.sneaking = controlState.sneak;
-      lastSent.input_data.stop_sneaking = !controlState.sneak;
       lastSent.input_data.sneak_current_raw = controlState.sneak;
-      lastSent.input_data.sneak_pressed_raw = controlState.sneak;
-      lastSent.input_data.sneak_released_raw = !controlState.sneak;
+
+      // Edge-triggered flags - set on state change, cleared next tick
+      if (controlState.sneak) {
+        lastSent.input_data.start_sneaking = true;
+        lastSent.input_data.sneak_pressed_raw = true;
+      } else {
+        lastSent.input_data.stop_sneaking = true;
+        lastSent.input_data.sneak_released_raw = true;
+      }
+    } else {
+      // Clear edge-triggered flags after first tick
+      lastSent.input_data.start_sneaking = false;
+      lastSent.input_data.sneak_pressed_raw = false;
+      lastSent.input_data.stop_sneaking = false;
+      lastSent.input_data.sneak_released_raw = false;
     }
 
     lastSent.input_data.vertical_collision = bot.entity.isCollidedVertically;
@@ -401,6 +442,26 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
   }
 
   bot.physics = physics;
+
+  // Test interface for manual tick control
+  if (skipPhysicsLoop) {
+    bot.test = {
+      tick: () => {
+        if (bot.physicsEnabled && shouldUsePhysics) {
+          updateCamera();
+          physics.simulatePlayer(new PlayerState(bot, controlState), world).apply(bot);
+          // Update eye height based on current pose (swimming = 0.4, standing = 1.62, etc.)
+          bot.entity.height = poseEyeHeight[bot.entity.pose ?? PlayerPose.STANDING] ?? 1.62;
+          bot.emit('physicsTick');
+        }
+        updatePosition(PHYSICS_TIMESTEP);
+        return structuredClone(lastSent);
+      },
+      setLastSent: (params: protocolTypes.packet_player_auth_input) => {
+        Object.assign(lastSent, params);
+      },
+    };
+  }
 
   function getMetadataForFlag(flag: string, state: boolean) {
     let metadata: any = {
@@ -560,7 +621,7 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
     if (start_game_packet)
       bot._client.once('spawn', async (packet) => {
         shouldUsePhysics = true;
-        if (doPhysicsTimer === null) {
+        if (doPhysicsTimer === null && !skipPhysicsLoop) {
           await bot.waitForChunksToLoad();
           lastPhysicsFrameTime = performance.now();
           doPhysicsTimer = doPhysicsTimer ?? setInterval(doPhysics, PHYSICS_INTERVAL_MS);
@@ -593,7 +654,7 @@ export default function inject(bot: BedrockBot, { physicsEnabled }: PhysicsOptio
 
   bot.on('spawn', async () => {
     shouldUsePhysics = true;
-    if (doPhysicsTimer === null) {
+    if (doPhysicsTimer === null && !skipPhysicsLoop) {
       await bot.waitForChunksToLoad();
       lastPhysicsFrameTime = performance.now();
       doPhysicsTimer = doPhysicsTimer ?? setInterval(doPhysics, PHYSICS_INTERVAL_MS);

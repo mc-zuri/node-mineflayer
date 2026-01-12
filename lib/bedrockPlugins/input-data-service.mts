@@ -59,13 +59,14 @@ export class InputDataService {
     this.#data.up_right = controlState.forward && controlState.right;
     this.#data.up_left = controlState.forward && controlState.left;
 
+    // Sprint start/stop based on sprint control state change
+    this.#data.start_sprinting = !this.#prevControlState.sprint && controlState.sprint;
+    this.#data.stop_sprinting = this.#prevControlState.sprint && !controlState.sprint;
+
     if (this.#prevControlState.sprint !== controlState.sprint) {
       this.#data.sprint_down = controlState.sprint;
       this.#data.sprinting = controlState.sprint;
     }
-
-    this.#data.start_sprinting = !this.#isMoving(this.#prevControlState) && this.#isMoving(controlState);
-    this.#data.stop_sprinting = this.#isMoving(this.#prevControlState) && !this.#isMoving(controlState);
 
     this.#prevControlState = { ...controlState };
     return {
